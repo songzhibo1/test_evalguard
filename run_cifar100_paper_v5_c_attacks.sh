@@ -57,7 +57,7 @@ DIST_BATCH=128
 
 RW=0.10
 D_LOGIT=15.0
-BETA=0.5
+BETA=0.7
 V_TEMP=15.0
 DELTA_MIN=0.5
 SWEEP_T=5
@@ -87,6 +87,8 @@ add_job() {
 # -----------------------------------------------------------------
 # Pre-download guard
 # -----------------------------------------------------------------
+export TORCH_HUB_OFFLINE=1
+
 if [ "${DRY_RUN}" != "1" ]; then
     echo "[prep] warming CIFAR-100 + SVHN cache..."
     python - <<'PY'
@@ -115,8 +117,10 @@ if step_enabled expC1; then
     for PAIR in "cifar100_resnet56:resnet56" "cifar100_resnet56:resnet20" "cifar100_vgg11:vgg11"; do
         TEACHER="${PAIR%%:*}"; STUDENT="${PAIR##*:}"
         SHORT_T="${TEACHER#cifar100_}"
-        REUSE_TAG="c100v5_${SHORT_T}_${STUDENT}_T${SWEEP_T}"
-        TAG="randkw_soft_${SHORT_T}_${STUDENT}"  # display-only tag
+        # 找到 expC1/C4/C5 循环里的这一行：
+        REUSE_TAG="c100v5_${SHORT_T}_${STUDENT}_T${SWEEP_T}_b${BETA}_d${D_LOGIT}"
+        # REUSE_TAG="c100v5_${SHORT_T}_${STUDENT}_T${SWEEP_T}"
+        TAG="randkw_soft_${SHORT_T}_${STUDENT}_b${BETA}"  # display-only tag
         ARGS="--experiment random_kw_fp \
 --model ${TEACHER} --student_arch ${STUDENT} \
 --label_mode soft --hard_label_mode bgs \
@@ -186,8 +190,10 @@ if step_enabled expC4; then
     for PAIR in "cifar100_resnet56:resnet56" "cifar100_vgg11:vgg11"; do
         TEACHER="${PAIR%%:*}"; STUDENT="${PAIR##*:}"
         SHORT_T="${TEACHER#cifar100_}"
-        REUSE_TAG="c100v5_${SHORT_T}_${STUDENT}_T${SWEEP_T}"
-        TAG="prune_soft_${SHORT_T}_${STUDENT}"
+        # # 找到 expC1/C4/C5 循环里的这一行：
+        REUSE_TAG="c100v5_${SHORT_T}_${STUDENT}_T${SWEEP_T}_b${BETA}_d${D_LOGIT}"
+        #REUSE_TAG="c100v5_${SHORT_T}_${STUDENT}_T${SWEEP_T}"
+        TAG="prune_soft_${SHORT_T}_${STUDENT}_b${BETA}"
         ARGS="--experiment pruning_attack \
 --model ${TEACHER} --student_arch ${STUDENT} \
 --label_mode soft \
@@ -210,8 +216,9 @@ if step_enabled expC5; then
     for PAIR in "cifar100_resnet56:resnet56" "cifar100_vgg11:vgg11"; do
         TEACHER="${PAIR%%:*}"; STUDENT="${PAIR##*:}"
         SHORT_T="${TEACHER#cifar100_}"
-        REUSE_TAG="c100v5_${SHORT_T}_${STUDENT}_T${SWEEP_T}"
-        TAG="quant_soft_${SHORT_T}_${STUDENT}"
+        REUSE_TAG="c100v5_${SHORT_T}_${STUDENT}_T${SWEEP_T}_b${BETA}_d${D_LOGIT}"
+        #REUSE_TAG="c100v5_${SHORT_T}_${STUDENT}_T${SWEEP_T}"
+        TAG="quant_soft_${SHORT_T}_${STUDENT}_b${BETA}"
         ARGS="--experiment quantization_attack \
 --model ${TEACHER} --student_arch ${STUDENT} \
 --label_mode soft \

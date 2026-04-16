@@ -63,7 +63,7 @@ FT_FRACS="0.0,0.01,0.05,0.10"
 
 RW=0.10
 D_LOGIT=15.0
-BETA=0.5
+BETA=0.7
 V_TEMP=15.0
 DELTA_MIN=0.5
 SWEEP_T=5
@@ -103,6 +103,9 @@ soft_args() {
 # -----------------------------------------------------------------
 # Pre-download guard
 # -----------------------------------------------------------------
+export TORCH_HUB_OFFLINE=1  # <--- 移动到这里，确保预热脚本也离线运行
+
+
 if [ "${DRY_RUN}" != "1" ]; then
     echo "[prep] warming CIFAR-100 cache..."
     python - <<'PY'
@@ -130,7 +133,8 @@ if step_enabled expA1; then
         TEACHER="${PAIR%%:*}"; STUDENT="${PAIR##*:}"
         SHORT_T="${TEACHER#cifar100_}"
         for T in 1 3 5 10; do
-            TAG="c100v5_${SHORT_T}_${STUDENT}_T${T}"
+            TAG="c100v5_${SHORT_T}_${STUDENT}_T${T}_b${BETA}_d${D_LOGIT}"
+           #TAG="c100v5_${SHORT_T}_${STUDENT}_T${T}"
             add_job "${TAG}" $(soft_args "${TEACHER}" "${STUDENT}" "${T}" "${RW}" "${D_LOGIT}" "${BETA}" "${V_TEMP}" "${TAG}" "--seed 42")
         done
     done
