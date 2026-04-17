@@ -36,7 +36,7 @@ from evalguard.watermark import (
 )
 from evalguard.crypto import keygen, kdf
 from evalguard.configs import (
-    CONFIGS, cifar10_data, cifar100_data, svhn_data,
+    CONFIGS, cifar10_data, cifar100_data, svhn_data, tinyimagenet_data,
     create_student,
 )
 from evalguard.attacks import (
@@ -57,18 +57,20 @@ CKPT_DIR = Path("checkpoints")
 # ============================================================
 
 MODEL_REGISTRY = {
-    "cifar10_resnet20":  ("cifar10_resnet20",  "cifar10"),
-    "cifar10_vgg11":     ("cifar10_vgg11",     "cifar10"),
-    "cifar100_resnet20": ("cifar100_resnet20", "cifar100"),
-    "cifar100_vgg11":    ("cifar100_vgg11",    "cifar100"),
-    "cifar100_resnet56": ("cifar100_resnet56", "cifar100"),
-    "cifar100_wrn2810":  ("cifar100_wrn2810",  "cifar100"),
-    "resnet50":          ("imagenet_resnet50", "imagenet"),
+    "cifar10_resnet20":      ("cifar10_resnet20",      "cifar10"),
+    "cifar10_vgg11":         ("cifar10_vgg11",         "cifar10"),
+    "cifar100_resnet20":     ("cifar100_resnet20",     "cifar100"),
+    "cifar100_vgg11":        ("cifar100_vgg11",        "cifar100"),
+    "cifar100_resnet56":     ("cifar100_resnet56",     "cifar100"),
+    "cifar100_wrn2810":      ("cifar100_wrn2810",      "cifar100"),
+    "tinyimagenet_resnet18": ("tinyimagenet_resnet18", "tinyimagenet"),
+    "resnet50":              ("imagenet_resnet50",     "imagenet"),
 }
 
 DATA_FN = {
-    "cifar10":  cifar10_data,
-    "cifar100": cifar100_data,
+    "cifar10":      cifar10_data,
+    "cifar100":     cifar100_data,
+    "tinyimagenet": tinyimagenet_data,
 }
 
 
@@ -1400,6 +1402,259 @@ def experiment_overhead(model, testloader, device, epsilon, delta,
 
 
 # ============================================================
+# Baseline Comparisons (Table X: DAWN / Adi vs. EvalGuard)
+# ============================================================
+
+def experiment_baseline_dawn(model, trainset, testset, testloader, latent_layer, device,
+                             teacher_name, student_arch, dataset, config,
+                             temperatures, n_queries, rw,
+                             eta, dist_epochs, dist_lr, dist_batch,
+                             ft_fractions, ft_epochs, ft_lr,
+                             delta_logit=2.0, beta=0.4, delta_min=0.5,
+                             verify_temperature=5.0,
+                             label_mode="soft", tag="", seed=None):
+    """
+    DAWN baseline comparison (Table X).
+
+    Runs the same extraction+fine-tuning pipeline but uses DAWN watermarking
+    instead of EvalGuard. DAWN flips top-1 for r_w fraction of queries.
+    """
+    from evalguard.baselines import (
+        DAWNWatermark, dawn_collect_hard_labels, dawn_collect_soft_labels,
+    )
+    from evalguard.attacks import (
+        soft_label_distillation, hard_label_extraction, fine_tune_surrogate,
+    )
+
+    nc = config["num_classes"]
+
+    print("\n" + "=" * 60)
+    print("BASELINE: DAWN Comparison [{}]".format(label_mode.upper()))
+    print("  Dataset: {}, T: {} -> S: {}".format(dataset, teacher_name, student_arch))
+    print("  r_w={}, nq={}".format(rw, n_queries))
+    print("=" * 60)
+
+    teacher = copy.deepcopy(model)
+    acc_t = evaluate_accuracy(teacher, testloader, device)
+
+    ql = DataLoader(Subset(trainset, list(range(min(n_queries, len(trainset))))),
+                    batch_size=64, shuffle=True, num_workers=2)
+
+    K_dawn = kdf(keygen(256, seed=seed), "dawn_watermark")
+    temp_list = temperatures if label_mode == "soft" else [5]
+
+    for T in temp_list:
+        print("\n--- T={} [{}] ---".format(T, label_mode))
+
+        if label_mode == "soft":
+            inp, soft_out, dawn_wm = dawn_collect_soft_labels(
+                teacher, ql, K_dawn, rw, T, device)
+            n_triggers = len(dawn_wm.trigger_set)
+            print("  DAWN: {} queries, {} triggers ({:.1f}%)".format(
+                len(inp), n_triggers, n_triggers / len(inp) * 100))
+
+            student = create_student(nc, student_arch)
+            student, _ = soft_label_distillation(
+                student, inp, soft_out, T, dist_epochs,
+                batch_size=dist_batch, lr=dist_lr, device=device)
+        else:
+            inp, hard_out, dawn_wm = dawn_collect_hard_labels(
+                teacher, ql, K_dawn, rw, nc, device)
+            n_triggers = len(dawn_wm.trigger_set)
+            print("  DAWN: {} queries, {} triggers ({:.1f}%)".format(
+                len(inp), n_triggers, n_triggers / len(inp) * 100))
+
+            student = create_student(nc, student_arch)
+            student, _ = hard_label_extraction(
+                student, inp, hard_out, dist_epochs,
+                batch_size=dist_batch, lr=dist_lr, device=device)
+
+        acc_s = evaluate_accuracy(student, testloader, device)
+        vr_base = dawn_wm.verify(student, device=device, eta=eta, num_classes=nc)
+        print("  Base: acc={:.1f}%, match_rate={:.3f}, p={:.2e}, V={}".format(
+            acc_s * 100, vr_base["match_rate"], vr_base["p_value"],
+            vr_base["verified"]))
+
+        ft_results = []
+        for frac in ft_fractions:
+            if frac == 0.0:
+                acc_ft, vr_ft = acc_s, vr_base
+            else:
+                nft = int(len(trainset) * frac)
+                fl = DataLoader(Subset(trainset, list(range(nft))),
+                                batch_size=128, shuffle=True)
+                surr_ft, _ = fine_tune_surrogate(
+                    copy.deepcopy(student), fl, ft_epochs, ft_lr, device)
+                acc_ft = evaluate_accuracy(surr_ft, testloader, device)
+                vr_ft = dawn_wm.verify(surr_ft, device=device, eta=eta,
+                                       num_classes=nc)
+
+            print("    FT {:.0f}%: acc={:.1f}%, match={:.3f}, p={:.2e}, V={}".format(
+                frac * 100, acc_ft * 100, vr_ft["match_rate"],
+                vr_ft["p_value"], vr_ft["verified"]))
+            ft_results.append({
+                "ft_fraction": frac,
+                "accuracy": round(acc_ft, 6),
+                **vr_ft,
+            })
+
+        fname = "DAWN__{}_{}__rw{}_T{}_nq{}{}".format(
+            teacher_name, student_arch, rw, T, n_queries,
+            ("__" + tag) if tag else "")
+        save_result({
+            "experiment": "baseline_dawn",
+            "timestamp": datetime.now().isoformat(),
+            "dataset": dataset,
+            "label_mode": label_mode,
+            "method": "DAWN",
+            "teacher": {**model_info(model, teacher_name), "accuracy": round(acc_t, 6)},
+            "student": {"architecture": student_arch},
+            "dawn_config": {"r_w": rw, "n_triggers": n_triggers},
+            "distillation_config": {
+                "temperature": T, "n_queries": n_queries,
+                "epochs": dist_epochs, "lr": dist_lr,
+            },
+            "baseline_result": {
+                "temperature": T,
+                "student_accuracy": round(acc_s, 6),
+                **vr_base,
+            },
+            "ft_results": ft_results,
+        }, dataset, "baseline_dawn", fname,
+            teacher_name=teacher_name, student_arch=student_arch,
+            label_mode="{}_label".format(label_mode))
+
+
+def experiment_baseline_adi(model, trainset, testset, testloader, latent_layer, device,
+                            teacher_name, student_arch, dataset, config,
+                            n_queries, rw,
+                            eta, dist_epochs, dist_lr, dist_batch,
+                            ft_fractions, ft_epochs, ft_lr,
+                            verify_temperature=5.0,
+                            tag="", seed=None,
+                            adi_n_triggers=100, adi_retrain_epochs=30,
+                            adi_lr=0.001):
+    """
+    Adi et al. (2018) backdoor watermark baseline comparison (Table X).
+
+    Flow: generate triggers → retrain teacher with backdoor → extract student
+    via soft-label distillation → verify if backdoor transfers → fine-tune attack.
+    """
+    from evalguard.baselines import AdiWatermark
+    from evalguard.attacks import (
+        collect_soft_labels, soft_label_distillation, fine_tune_surrogate,
+    )
+
+    nc = config["num_classes"]
+    img_shape = (3, 32, 32)
+    if dataset == "tinyimagenet":
+        img_shape = (3, 64, 64)
+
+    print("\n" + "=" * 60)
+    print("BASELINE: Adi et al. Backdoor Watermark")
+    print("  Dataset: {}, T: {} -> S: {}".format(dataset, teacher_name, student_arch))
+    print("  n_triggers={}, retrain_epochs={}".format(adi_n_triggers, adi_retrain_epochs))
+    print("=" * 60)
+
+    acc_t = evaluate_accuracy(model, testloader, device)
+
+    adi = AdiWatermark(num_classes=nc, n_triggers=adi_n_triggers,
+                       img_shape=img_shape, seed=seed or 42)
+
+    print("  Retraining teacher with {} backdoor triggers...".format(adi_n_triggers))
+    trainloader = DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
+    teacher_bd = adi.embed_backdoor(
+        model, trainloader, epochs=adi_retrain_epochs,
+        lr=adi_lr, device=device)
+
+    acc_t_bd = evaluate_accuracy(teacher_bd, testloader, device)
+    bd_success = adi.verify_on_teacher(teacher_bd, device)
+    print("  Backdoored teacher: acc={:.1f}% (orig {:.1f}%), backdoor_success={:.1f}%".format(
+        acc_t_bd * 100, acc_t * 100, bd_success * 100))
+
+    ql = DataLoader(Subset(trainset, list(range(min(n_queries, len(trainset))))),
+                    batch_size=64, shuffle=True, num_workers=2)
+
+    T = 5
+    print("\n--- Distilling from backdoored teacher (T={}) ---".format(T))
+    teacher_bd.to(device).eval()
+    all_inputs, all_soft = [], []
+    with torch.no_grad():
+        for inputs, _ in ql:
+            inputs = inputs.to(device)
+            logits = teacher_bd(inputs)
+            probs = torch.softmax(logits / T, dim=-1)
+            all_inputs.append(inputs.cpu())
+            all_soft.append(probs.cpu())
+    inp = torch.cat(all_inputs, 0)
+    soft_out = torch.cat(all_soft, 0)
+
+    student = create_student(nc, student_arch)
+    student, _ = soft_label_distillation(
+        student, inp, soft_out, T, dist_epochs,
+        batch_size=dist_batch, lr=dist_lr, device=device)
+
+    acc_s = evaluate_accuracy(student, testloader, device)
+    vr_base = adi.verify(student, device=device, eta=eta)
+    print("  Student: acc={:.1f}%, backdoor_match={:.1f}%, p={:.2e}, V={}".format(
+        acc_s * 100, vr_base["match_rate"] * 100, vr_base["p_value"],
+        vr_base["verified"]))
+
+    ft_results = []
+    for frac in ft_fractions:
+        if frac == 0.0:
+            acc_ft, vr_ft = acc_s, vr_base
+        else:
+            nft = int(len(trainset) * frac)
+            fl = DataLoader(Subset(trainset, list(range(nft))),
+                            batch_size=128, shuffle=True)
+            surr_ft, _ = fine_tune_surrogate(
+                copy.deepcopy(student), fl, ft_epochs, ft_lr, device)
+            acc_ft = evaluate_accuracy(surr_ft, testloader, device)
+            vr_ft = adi.verify(surr_ft, device=device, eta=eta)
+
+        print("    FT {:.0f}%: acc={:.1f}%, backdoor_match={:.1f}%, p={:.2e}, V={}".format(
+            frac * 100, acc_ft * 100, vr_ft["match_rate"] * 100,
+            vr_ft["p_value"], vr_ft["verified"]))
+        ft_results.append({
+            "ft_fraction": frac,
+            "accuracy": round(acc_ft, 6),
+            **vr_ft,
+        })
+
+    fname = "ADI__{}_{}__ntrig{}_nq{}{}".format(
+        teacher_name, student_arch, adi_n_triggers, n_queries,
+        ("__" + tag) if tag else "")
+    save_result({
+        "experiment": "baseline_adi",
+        "timestamp": datetime.now().isoformat(),
+        "dataset": dataset,
+        "method": "Adi_et_al_2018",
+        "teacher": {**model_info(model, teacher_name),
+                    "accuracy_original": round(acc_t, 6),
+                    "accuracy_backdoored": round(acc_t_bd, 6),
+                    "backdoor_success_rate": round(bd_success, 6)},
+        "student": {"architecture": student_arch},
+        "adi_config": {
+            "n_triggers": adi_n_triggers,
+            "retrain_epochs": adi_retrain_epochs,
+            "lr": adi_lr,
+        },
+        "distillation_config": {
+            "temperature": T, "n_queries": n_queries,
+            "epochs": dist_epochs, "lr": dist_lr,
+        },
+        "baseline_result": {
+            "student_accuracy": round(acc_s, 6),
+            **vr_base,
+        },
+        "ft_results": ft_results,
+    }, dataset, "baseline_adi", fname,
+        teacher_name=teacher_name, student_arch=student_arch,
+        label_mode="soft_label")
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -1417,7 +1672,9 @@ def main():
     pa.add_argument("--experiment", default="distill",
                     choices=["fidelity", "finetune", "distill", "surrogate_ft",
                              "overhead", "random_kw_fp",
-                             "pruning_attack", "quantization_attack", "all"])
+                             "pruning_attack", "quantization_attack",
+                             "baseline_dawn", "baseline_adi",
+                             "all"])
     pa.add_argument("--model", default="cifar10_vgg11")
     pa.add_argument("--dataset", default=None)
     pa.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -1515,6 +1772,14 @@ def main():
                          "'testset' is the true zero-leakage probe.")
 
     pa.add_argument("--epsilons", type=str, default="1,10,50,100,200")
+
+    # Adi et al. baseline parameters
+    pa.add_argument("--adi_n_triggers", type=int, default=100,
+                    help="Number of random trigger images for Adi backdoor baseline.")
+    pa.add_argument("--adi_retrain_epochs", type=int, default=30,
+                    help="Epochs to retrain teacher with backdoor triggers.")
+    pa.add_argument("--adi_lr", type=float, default=0.001,
+                    help="Learning rate for Adi backdoor retraining.")
 
     pa.add_argument("--seed", type=int, default=None,
                     help="Deterministic seed for K_w generation. Same seed → same "
@@ -1671,6 +1936,32 @@ def main():
     if a.experiment in ("overhead", "all"):
         experiment_overhead(model, testloader, a.device, a.epsilon, a.delta,
                             teacher_short, dataset, config)
+
+    if a.experiment in ("baseline_dawn",):
+        for lm in label_modes:
+            experiment_baseline_dawn(model, trainset, testset, testloader,
+                                     latent_layer, a.device,
+                                     teacher_short, a.student_arch, dataset, config,
+                                     temperatures, a.nq, a.rw,
+                                     2**(-64), a.dist_epochs, a.dist_lr, a.dist_batch,
+                                     ft_fractions, a.ft_epochs, a.ft_lr,
+                                     delta_logit=a.delta_logit, beta=a.beta,
+                                     delta_min=a.delta_min,
+                                     verify_temperature=a.verify_temperature,
+                                     label_mode=lm, tag=a.tag, seed=a.seed)
+
+    if a.experiment in ("baseline_adi",):
+        experiment_baseline_adi(model, trainset, testset, testloader,
+                                latent_layer, a.device,
+                                teacher_short, a.student_arch, dataset, config,
+                                a.nq, a.rw,
+                                2**(-64), a.dist_epochs, a.dist_lr, a.dist_batch,
+                                ft_fractions, a.ft_epochs, a.ft_lr,
+                                verify_temperature=a.verify_temperature,
+                                tag=a.tag, seed=a.seed,
+                                adi_n_triggers=a.adi_n_triggers,
+                                adi_retrain_epochs=a.adi_retrain_epochs,
+                                adi_lr=a.adi_lr)
 
     print("\nResults: ./results/{}/{}/   Checkpoints: ./checkpoints/distill/{}/".format(
         a.experiment, dataset, dataset))

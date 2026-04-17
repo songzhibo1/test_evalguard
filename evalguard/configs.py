@@ -4,8 +4,14 @@ EvalGuard — Dataset/Model Configurations (Section VI-A, Table IV)
 [v3] Added stronger teachers for CIFAR-100:
   - ResNet-56 (~74% acc, pretrained via torch.hub)
   - WideResNet-28-10 (~78% acc, manual build, needs training or --pretrained)
+[v4] Added Tiny-ImageNet-200 (64x64, 200 classes) for generalization experiments.
 """
 from __future__ import annotations
+
+import os
+import zipfile
+import shutil
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -81,6 +87,76 @@ def svhn_data(batch_size=128, normalize_for="cifar10"):
     trainset = torchvision.datasets.SVHN(root="./data", split="train", download=True, transform=transform)
     testset = torchvision.datasets.SVHN(root="./data", split="test", download=True, transform=transform)
     return trainset, testset, DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2), \
+           DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+
+def _organize_tinyimagenet_val(data_dir):
+    """Reorganize Tiny-ImageNet val/ into class-based folders for ImageFolder."""
+    val_dir = Path(data_dir) / "val"
+    organized_dir = Path(data_dir) / "val_organized"
+    if organized_dir.exists():
+        return
+    ann_file = val_dir / "val_annotations.txt"
+    if not ann_file.exists():
+        raise FileNotFoundError(
+            "Tiny-ImageNet val_annotations.txt not found. "
+            "Download tiny-imagenet-200.zip and extract to ./data/tiny-imagenet-200/")
+    organized_dir.mkdir(parents=True, exist_ok=True)
+    with open(ann_file) as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            fname, cls = parts[0], parts[1]
+            cls_dir = organized_dir / cls
+            cls_dir.mkdir(exist_ok=True)
+            src = val_dir / "images" / fname
+            dst = cls_dir / fname
+            if src.exists() and not dst.exists():
+                shutil.copy2(src, dst)
+    print("  Tiny-ImageNet val organized into {} classes.".format(
+        len(list(organized_dir.iterdir()))))
+
+
+def tinyimagenet_data(batch_size=128):
+    """
+    Tiny-ImageNet-200: 200 classes, 64x64 RGB images.
+    100K train, 10K val.
+
+    Expects data at ./data/tiny-imagenet-200/ (download separately):
+      wget http://cs231n.stanford.edu/tiny-imagenet-200.zip
+      unzip tiny-imagenet-200.zip -d ./data/
+    """
+    data_dir = Path("./data/tiny-imagenet-200")
+    if not data_dir.exists():
+        zip_path = Path("./data/tiny-imagenet-200.zip")
+        if zip_path.exists():
+            print("[INFO] Extracting tiny-imagenet-200.zip...")
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall("./data/")
+        else:
+            raise FileNotFoundError(
+                "Tiny-ImageNet not found. Download:\n"
+                "  wget http://cs231n.stanford.edu/tiny-imagenet-200.zip -P ./data/\n"
+                "  unzip ./data/tiny-imagenet-200.zip -d ./data/")
+
+    _organize_tinyimagenet_val(data_dir)
+
+    mean, std = (0.4802, 0.4481, 0.3975), (0.2302, 0.2265, 0.2262)
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(64, padding=8),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+    trainset = torchvision.datasets.ImageFolder(
+        str(data_dir / "train"), transform=transform_train)
+    testset = torchvision.datasets.ImageFolder(
+        str(data_dir / "val_organized"), transform=transform_test)
+    return trainset, testset, \
+           DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2), \
            DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
 
 
@@ -196,6 +272,34 @@ def agnews_roberta(pretrained=True):
     return None, None
 
 
+# --- Tiny-ImageNet ---
+def _build_resnet18_64(num_classes=200):
+    """ResNet-18 adapted for 64x64 input (smaller first conv, no maxpool)."""
+    model = torchvision.models.resnet18(num_classes=num_classes)
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    model.maxpool = nn.Identity()
+    return model
+
+
+def tinyimagenet_resnet18(pretrained=True):
+    """
+    ResNet-18 on Tiny-ImageNet-200: ~62-65% top-1 accuracy.
+    Pre-trained weights must be at pretrained/tinyimagenet_resnet18.pt.
+    Train with: python train_teacher.py --dataset tinyimagenet --epochs 100
+    """
+    print("[INFO] Loading Tiny-ImageNet ResNet-18...")
+    model = _build_resnet18_64(num_classes=200)
+    if pretrained:
+        ckpt = Path("pretrained/tinyimagenet_resnet18.pt")
+        if ckpt.exists():
+            model.load_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True))
+            print("  Loaded pretrained weights from {}".format(ckpt))
+        else:
+            print("[WARN] No pretrained weights at {}. Train first:\n"
+                  "  python train_teacher.py --dataset tinyimagenet --epochs 100".format(ckpt))
+    return model, "layer4"
+
+
 # ============================================================
 # Student Models
 # ============================================================
@@ -252,6 +356,7 @@ CONFIGS = {
     "cifar100_vgg11":    {"data_fn": cifar100_data, "model_fn": cifar100_vgg11,    "num_classes": 100, "baseline_acc": 70.0, "random_guess": 1.0,  "k": 4},
     "cifar100_resnet56": {"data_fn": cifar100_data, "model_fn": cifar100_resnet56, "num_classes": 100, "baseline_acc": 74.0, "random_guess": 1.0,  "k": 4},
     "cifar100_wrn2810":  {"data_fn": cifar100_data, "model_fn": cifar100_wrn2810,  "num_classes": 100, "baseline_acc": 78.0, "random_guess": 1.0,  "k": 4},
+    "tinyimagenet_resnet18": {"data_fn": tinyimagenet_data, "model_fn": tinyimagenet_resnet18, "num_classes": 200, "baseline_acc": 63.0, "random_guess": 0.5, "k": 4},
     "imagenet_resnet50": {"data_fn": None,          "model_fn": imagenet_resnet50, "num_classes": 1000,"baseline_acc": 76.1, "random_guess": 0.1,  "k": 4},
     "agnews_roberta":    {"data_fn": None,          "model_fn": agnews_roberta,    "num_classes": 4,   "baseline_acc": 94.5, "random_guess": 25.0, "k": 3},
 }
