@@ -6,24 +6,25 @@
 # Third dataset for generalization evaluation. Demonstrates EvalGuard works
 # on a different resolution (64x64), class count (200), and domain.
 #
-# Teacher:  ResNet-18 (modified for 64x64, trained from scratch, ~63% top-1)
+# Teacher:  ResNet-18 (modified for 64x64, ~60.23% top-1)
+#           Auto-downloaded from HuggingFace: zeyuanyin/tiny-imagenet (rn18_100ep)
+#           Cached to pretrained/tinyimagenet_resnet18.pt on first run.
 # Students: resnet18 (same-arch), mobilenetv2 (cross-arch)
 #
 # PREREQUISITES:
 #   1. Download Tiny-ImageNet:
 #      wget http://cs231n.stanford.edu/tiny-imagenet-200.zip -P ./data/
 #      unzip ./data/tiny-imagenet-200.zip -d ./data/
-#   2. Train teacher (if not already done):
-#      python train_teacher.py --dataset tinyimagenet --epochs 100 --device cuda
+#   (Teacher weights are downloaded automatically — no manual training needed.)
 #
 # Available STEPS:
-#   exp1   Soft-label main (2 pairs x T=5)                     2 jobs
-#   exp2   Hard-label BGS (2 pairs)                             2 jobs
+#   exp1   Soft-label main (2 students x T=1,3,5,10)           8 jobs
+#   exp2   Hard-label BGS (2 students x T=5)                   2 jobs
 #   exp3   Pruning attack (50%) + INT8 quantization             2 jobs
 #   exp4   FP scan (N=100 random keys)                          1 job
 #   exp5   Fidelity (obfuscation roundtrip)                     1 job
 #   exp6   Overhead measurement                                 1 job
-#                                                    Total =  9 jobs
+#                                                    Total = 15 jobs
 #
 # Usage:
 #   GPU_IDS="0" ./run_tinyimagenet_paper.sh
@@ -49,10 +50,10 @@ NUM_GPUS=${#GPU_LIST[@]}
 # Tiny-ImageNet hyper-parameters
 # -----------------------------------------------------------------
 NQ=50000
-DIST_EP=100
+DIST_EP=150          # Tiny-ImageNet is harder (200 cls, 64x64); cf. CIFAR-100=160
 DIST_LR=0.002
 DIST_BATCH=128
-FT_EP=30
+FT_EP=40             # fine-tune budget; cf. CIFAR-100=40
 FT_LR=0.0005
 FT_FRACS="0.0,0.01,0.05,0.10"
 
@@ -61,7 +62,8 @@ D_LOGIT=15.0
 BETA=0.7
 V_TEMP=16.5          # recommended_vT(200) = max(5, 5*log10(200)+5) ≈ 16.5
 DELTA_MIN=0.5
-SWEEP_T=5
+SWEEP_T=5            # single T used for exp2-6 (attacks / ablations)
+TEMPS="1 3 5 10"     # temperature sweep for exp1 main table (cf. CIFAR-100 expA1)
 
 # Hard-label BGS
 HARD_TAU_Q=0.10
@@ -95,30 +97,47 @@ if [ "${DRY_RUN}" != "1" ]; then
         echo "  unzip ./data/tiny-imagenet-200.zip -d ./data/"
         exit 1
     fi
-    # Check pretrained teacher
+    # Download pretrained teacher from HuggingFace if not cached
     if [ ! -f "./pretrained/tinyimagenet_resnet18.pt" ]; then
-        echo "[WARN] No pretrained teacher. Training now..."
-        python train_teacher.py --dataset tinyimagenet --epochs 100 --device cuda
+        echo "[INFO] Downloading pretrained ResNet-18 from HuggingFace (zeyuanyin/tiny-imagenet, rn18_100ep, 60.23% top-1)..."
+        mkdir -p ./pretrained
+        python - <<'PY'
+import urllib.request, torch
+from pathlib import Path
+url = "https://huggingface.co/zeyuanyin/tiny-imagenet/resolve/main/rn18_100ep/checkpoint.pth"
+tmp = Path("/tmp/tinyimagenet_hf_ckpt.pth")
+print("  Downloading checkpoint...")
+urllib.request.urlretrieve(url, str(tmp))
+raw = torch.load(tmp, map_location="cpu", weights_only=False)
+# HuggingFace checkpoint: {"model": state_dict, "optimizer": ..., "epoch": ..., ...}
+state = raw["model"] if isinstance(raw, dict) and "model" in raw else raw
+out = Path("pretrained/tinyimagenet_resnet18.pt")
+torch.save(state, str(out))
+tmp.unlink(missing_ok=True)
+print("  Cached state_dict to {}".format(out))
+PY
     fi
     echo "[prep] Tiny-ImageNet ready."
 fi
 
 
 # =============================================================================
-# EXP 1 -- Soft-label main table (2 pairs x T=5) = 2 jobs
+# EXP 1 -- Soft-label main table (2 students x T=1,3,5,10) = 8 jobs
 # =============================================================================
 if step_enabled exp1; then
     for STUDENT in resnet18 mobilenetv2; do
-        TAG="tinyimg_soft_r18_${STUDENT}_T${SWEEP_T}_b${BETA}_d${D_LOGIT}"
-        add_job "${TAG}" --experiment surrogate_ft \
-            --model tinyimagenet_resnet18 --student_arch "${STUDENT}" \
-            --label_mode soft --trigger_mode rec_trigger \
-            --rw "${RW}" --delta_logit "${D_LOGIT}" --beta "${BETA}" --delta_min "${DELTA_MIN}" \
-            --verify_temperature "${V_TEMP}" \
-            --temperatures "${SWEEP_T}" --nq "${NQ}" \
-            --dist_epochs "${DIST_EP}" --dist_lr "${DIST_LR}" --dist_batch "${DIST_BATCH}" \
-            --ft_epochs "${FT_EP}" --ft_lr "${FT_LR}" --ft_fractions "${FT_FRACS}" \
-            --device cuda --tag "${TAG}" --seed 42
+        for T in ${TEMPS}; do
+            TAG="tinyimg_soft_r18_${STUDENT}_T${T}_b${BETA}_d${D_LOGIT}"
+            add_job "${TAG}" --experiment surrogate_ft \
+                --model tinyimagenet_resnet18 --student_arch "${STUDENT}" \
+                --label_mode soft --trigger_mode rec_trigger \
+                --rw "${RW}" --delta_logit "${D_LOGIT}" --beta "${BETA}" --delta_min "${DELTA_MIN}" \
+                --verify_temperature "${V_TEMP}" \
+                --temperatures "${T}" --nq "${NQ}" \
+                --dist_epochs "${DIST_EP}" --dist_lr "${DIST_LR}" --dist_batch "${DIST_BATCH}" \
+                --ft_epochs "${FT_EP}" --ft_lr "${FT_LR}" --ft_fractions "${FT_FRACS}" \
+                --device cuda --tag "${TAG}" --seed 42
+        done
     done
 fi
 
@@ -219,8 +238,8 @@ echo " GPUs       : ${GPU_LIST[*]} (${NUM_GPUS})"
 echo " STEPS      : ${STEPS}"
 echo " Total jobs : ${JOB_COUNT}"
 echo " LOG_DIR    : ${LOG_DIR}"
-echo " Params     : DIST_EP=${DIST_EP}, NQ=${NQ}, RW=${RW},"
-echo "              D=${D_LOGIT}, BETA=${BETA}, V_TEMP=${V_TEMP}"
+echo " Params     : DIST_EP=${DIST_EP}, FT_EP=${FT_EP}, NQ=${NQ}, RW=${RW},"
+echo "              D=${D_LOGIT}, BETA=${BETA}, V_TEMP=${V_TEMP}, TEMPS=${TEMPS}"
 echo "============================================================"
 
 echo ""

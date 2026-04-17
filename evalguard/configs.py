@@ -23,6 +23,11 @@ import ssl
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
+# HuggingFace pretrained ResNet-18 for Tiny-ImageNet-200 (zeyuanyin/tiny-imagenet, rn18_100ep, 60.23% top-1)
+_HF_TINYIMAGENET_URL = (
+    "https://huggingface.co/zeyuanyin/tiny-imagenet/resolve/main/rn18_100ep/checkpoint.pth"
+)
+
 
 # ============================================================
 # Data
@@ -283,20 +288,29 @@ def _build_resnet18_64(num_classes=200):
 
 def tinyimagenet_resnet18(pretrained=True):
     """
-    ResNet-18 on Tiny-ImageNet-200: ~62-65% top-1 accuracy.
-    Pre-trained weights must be at pretrained/tinyimagenet_resnet18.pt.
-    Train with: python train_teacher.py --dataset tinyimagenet --epochs 100
+    ResNet-18 on Tiny-ImageNet-200: ~60% top-1 accuracy.
+    Weights are auto-downloaded from HuggingFace (zeyuanyin/tiny-imagenet, rn18_100ep)
+    and cached at pretrained/tinyimagenet_resnet18.pt on first use.
     """
     print("[INFO] Loading Tiny-ImageNet ResNet-18...")
     model = _build_resnet18_64(num_classes=200)
     if pretrained:
         ckpt = Path("pretrained/tinyimagenet_resnet18.pt")
-        if ckpt.exists():
-            model.load_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True))
-            print("  Loaded pretrained weights from {}".format(ckpt))
-        else:
-            print("[WARN] No pretrained weights at {}. Train first:\n"
-                  "  python train_teacher.py --dataset tinyimagenet --epochs 100".format(ckpt))
+        if not ckpt.exists():
+            print("[INFO] Downloading pretrained weights from HuggingFace...")
+            ckpt.parent.mkdir(exist_ok=True)
+            import urllib.request
+            tmp = Path("/tmp/tinyimagenet_hf_ckpt.pth")
+            urllib.request.urlretrieve(_HF_TINYIMAGENET_URL, str(tmp))
+            raw = torch.load(tmp, map_location="cpu", weights_only=False)
+            # HuggingFace checkpoint is {"model": state_dict, "optimizer": ..., ...}
+            state = raw["model"] if isinstance(raw, dict) and "model" in raw else raw
+            torch.save(state, str(ckpt))
+            tmp.unlink(missing_ok=True)
+            print("  Cached state_dict to {}".format(ckpt))
+        state = torch.load(ckpt, map_location="cpu", weights_only=True)
+        model.load_state_dict(state)
+        print("  Loaded pretrained weights from {}".format(ckpt))
     return model, "layer4"
 
 
@@ -356,7 +370,7 @@ CONFIGS = {
     "cifar100_vgg11":    {"data_fn": cifar100_data, "model_fn": cifar100_vgg11,    "num_classes": 100, "baseline_acc": 70.0, "random_guess": 1.0,  "k": 4},
     "cifar100_resnet56": {"data_fn": cifar100_data, "model_fn": cifar100_resnet56, "num_classes": 100, "baseline_acc": 74.0, "random_guess": 1.0,  "k": 4},
     "cifar100_wrn2810":  {"data_fn": cifar100_data, "model_fn": cifar100_wrn2810,  "num_classes": 100, "baseline_acc": 78.0, "random_guess": 1.0,  "k": 4},
-    "tinyimagenet_resnet18": {"data_fn": tinyimagenet_data, "model_fn": tinyimagenet_resnet18, "num_classes": 200, "baseline_acc": 63.0, "random_guess": 0.5, "k": 4},
+    "tinyimagenet_resnet18": {"data_fn": tinyimagenet_data, "model_fn": tinyimagenet_resnet18, "num_classes": 200, "baseline_acc": 60.23, "random_guess": 0.5, "k": 4},
     "imagenet_resnet50": {"data_fn": None,          "model_fn": imagenet_resnet50, "num_classes": 1000,"baseline_acc": 76.1, "random_guess": 0.1,  "k": 4},
     "agnews_roberta":    {"data_fn": None,          "model_fn": agnews_roberta,    "num_classes": 4,   "baseline_acc": 94.5, "random_guess": 25.0, "k": 3},
 }
