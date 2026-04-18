@@ -173,14 +173,19 @@ def stem_ckpt(teacher, student, rw, nq, T, dist_epochs, dist_lr, delta_logit=2.0
 # Save / Load
 # ============================================================
 
-def save_result(data, dataset, subdir, filename, teacher_name=None, student_arch=None, label_mode=None):
+def save_result(data, dataset, subdir, filename, teacher_name=None, student_arch=None, label_mode=None, method=None):
     """
-    Save result JSON with directory structure:
-      results/<subdir>/<dataset>/<teacher>_<student>/<label_mode>/<filename>.json
+    Save result JSON.
 
-    Falls back to old structure if teacher_name/student_arch/label_mode not provided.
+    When `method` is provided (e.g. "DAWN", "Adi", "EvalGuard"), saves to:
+      results/baseline/<dataset>/<method>/<filename>.json
+
+    Otherwise uses the standard structure:
+      results/<subdir>/<dataset>/<teacher>_<student>/<label_mode>/<filename>.json
     """
-    if teacher_name and student_arch and label_mode:
+    if method is not None:
+        path = RESULTS_DIR / "baseline" / dataset / method / "{}.json".format(filename)
+    elif teacher_name and student_arch and label_mode:
         model_dir = "{}_{}".format(teacher_name, student_arch)
         path = RESULTS_DIR / subdir / dataset / model_dir / label_mode / "{}.json".format(filename)
     elif teacher_name and label_mode:
@@ -771,7 +776,8 @@ def experiment_surrogate_ft(model, trainset, testset, testloader, latent_layer, 
                             seed=None,
                             hard_label_mode="bgs", margin_tau_hard=1.5,
                             hard_tau_quantile=-1.0,
-                            hard_tau_calib_samples=3000):
+                            hard_tau_calib_samples=3000,
+                            baseline_method=None):
     """
     Table VII: Surrogate Fine-Tuning Attack.
 
@@ -1042,7 +1048,9 @@ def experiment_surrogate_ft(model, trainset, testset, testloader, latent_layer, 
                 },
                 "ft_results": ft_results,
             }, dataset, "surrogate_ft", fname,
-                teacher_name=teacher_name, student_arch=student_arch,
+                method=baseline_method,
+                teacher_name=teacher_name if not baseline_method else None,
+                student_arch=student_arch if not baseline_method else None,
                 label_mode=save_label)
 
 
@@ -1520,9 +1528,7 @@ def experiment_baseline_dawn(model, trainset, testset, testloader, latent_layer,
                 **vr_base,
             },
             "ft_results": ft_results,
-        }, dataset, "baseline_dawn", fname,
-            teacher_name=teacher_name, student_arch=student_arch,
-            label_mode="{}_label".format(label_mode))
+        }, dataset, "baseline_dawn", fname, method="DAWN")
 
 
 def experiment_baseline_adi(model, trainset, testset, testloader, latent_layer, device,
@@ -1531,6 +1537,7 @@ def experiment_baseline_adi(model, trainset, testset, testloader, latent_layer, 
                             eta, dist_epochs, dist_lr, dist_batch,
                             ft_fractions, ft_epochs, ft_lr,
                             verify_temperature=5.0,
+                            label_mode="soft",
                             tag="", seed=None,
                             adi_n_triggers=100, adi_retrain_epochs=30,
                             adi_lr=0.001):
@@ -1538,11 +1545,17 @@ def experiment_baseline_adi(model, trainset, testset, testloader, latent_layer, 
     Adi et al. (2018) backdoor watermark baseline comparison (Table X).
 
     Flow: generate triggers → retrain teacher with backdoor → extract student
-    via soft-label distillation → verify if backdoor transfers → fine-tune attack.
+    via soft or hard-label distillation → verify if backdoor transfers → fine-tune.
+
+    Note: the Adi backdoor embeds information in the full logit distribution, so
+    hard-label extraction (argmax only) is expected to *not* transfer the backdoor.
+    Running label_mode="hard" demonstrates this failure mode explicitly.
     """
     from evalguard.baselines import AdiWatermark
     from evalguard.attacks import (
-        collect_soft_labels, soft_label_distillation, fine_tune_surrogate,
+        collect_soft_labels, soft_label_distillation,
+        collect_hard_labels, hard_label_extraction,
+        fine_tune_surrogate,
     )
 
     nc = config["num_classes"]
@@ -1551,7 +1564,7 @@ def experiment_baseline_adi(model, trainset, testset, testloader, latent_layer, 
         img_shape = (3, 64, 64)
 
     print("\n" + "=" * 60)
-    print("BASELINE: Adi et al. Backdoor Watermark")
+    print("BASELINE: Adi et al. Backdoor Watermark [{}]".format(label_mode.upper()))
     print("  Dataset: {}, T: {} -> S: {}".format(dataset, teacher_name, student_arch))
     print("  n_triggers={}, retrain_epochs={}".format(adi_n_triggers, adi_retrain_epochs))
     print("=" * 60)
@@ -1576,23 +1589,29 @@ def experiment_baseline_adi(model, trainset, testset, testloader, latent_layer, 
                     batch_size=64, shuffle=True, num_workers=2)
 
     T = 5
-    print("\n--- Distilling from backdoored teacher (T={}) ---".format(T))
+    print("\n--- Distilling from backdoored teacher (T={}, mode={}) ---".format(T, label_mode))
     teacher_bd.to(device).eval()
-    all_inputs, all_soft = [], []
-    with torch.no_grad():
-        for inputs, _ in ql:
-            inputs = inputs.to(device)
-            logits = teacher_bd(inputs)
-            probs = torch.softmax(logits / T, dim=-1)
-            all_inputs.append(inputs.cpu())
-            all_soft.append(probs.cpu())
-    inp = torch.cat(all_inputs, 0)
-    soft_out = torch.cat(all_soft, 0)
 
     student = create_student(nc, student_arch)
-    student, _ = soft_label_distillation(
-        student, inp, soft_out, T, dist_epochs,
-        batch_size=dist_batch, lr=dist_lr, device=device)
+    if label_mode == "hard":
+        inp, hard_out = collect_hard_labels(teacher_bd, ql, device)
+        student, _ = hard_label_extraction(
+            student, inp, hard_out, dist_epochs,
+            batch_size=dist_batch, lr=dist_lr, device=device)
+    else:
+        all_inputs, all_soft = [], []
+        with torch.no_grad():
+            for inputs, _ in ql:
+                inputs = inputs.to(device)
+                logits = teacher_bd(inputs)
+                probs = torch.softmax(logits / T, dim=-1)
+                all_inputs.append(inputs.cpu())
+                all_soft.append(probs.cpu())
+        inp = torch.cat(all_inputs, 0)
+        soft_out = torch.cat(all_soft, 0)
+        student, _ = soft_label_distillation(
+            student, inp, soft_out, T, dist_epochs,
+            batch_size=dist_batch, lr=dist_lr, device=device)
 
     acc_s = evaluate_accuracy(student, testloader, device)
     vr_base = adi.verify(student, device=device, eta=eta)
@@ -1622,14 +1641,15 @@ def experiment_baseline_adi(model, trainset, testset, testloader, latent_layer, 
             **vr_ft,
         })
 
-    fname = "ADI__{}_{}__ntrig{}_nq{}{}".format(
-        teacher_name, student_arch, adi_n_triggers, n_queries,
+    fname = "ADI__{}_{}__{}__ntrig{}_nq{}{}".format(
+        teacher_name, student_arch, label_mode, adi_n_triggers, n_queries,
         ("__" + tag) if tag else "")
     save_result({
         "experiment": "baseline_adi",
         "timestamp": datetime.now().isoformat(),
         "dataset": dataset,
         "method": "Adi_et_al_2018",
+        "label_mode": label_mode,
         "teacher": {**model_info(model, teacher_name),
                     "accuracy_original": round(acc_t, 6),
                     "accuracy_backdoored": round(acc_t_bd, 6),
@@ -1643,15 +1663,14 @@ def experiment_baseline_adi(model, trainset, testset, testloader, latent_layer, 
         "distillation_config": {
             "temperature": T, "n_queries": n_queries,
             "epochs": dist_epochs, "lr": dist_lr,
+            "label_mode": label_mode,
         },
         "baseline_result": {
             "student_accuracy": round(acc_s, 6),
             **vr_base,
         },
         "ft_results": ft_results,
-    }, dataset, "baseline_adi", fname,
-        teacher_name=teacher_name, student_arch=student_arch,
-        label_mode="soft_label")
+    }, dataset, "baseline_adi", fname, method="Adi")
 
 
 # ============================================================
@@ -1791,6 +1810,12 @@ def main():
                          "filenames. Use this to distinguish runs with different "
                          "watermark parameters (e.g. 'paper', 'amplified', 'smoke').")
 
+    pa.add_argument("--baseline_method", default=None,
+                    choices=["EvalGuard", "DAWN", "Adi"],
+                    help="When set, routes surrogate_ft results to "
+                         "results/baseline/<dataset>/<baseline_method>/ "
+                         "for side-by-side baseline comparison tables.")
+
     a = pa.parse_args()
 
     config_key, dataset, teacher_short = resolve_model(a.model, a.dataset)
@@ -1887,7 +1912,8 @@ def main():
                                     hard_label_mode=a.hard_label_mode,
                                     margin_tau_hard=a.margin_tau_hard,
                                     hard_tau_quantile=a.hard_tau_quantile,
-                                    hard_tau_calib_samples=a.hard_tau_calib_samples)
+                                    hard_tau_calib_samples=a.hard_tau_calib_samples,
+                                    baseline_method=a.baseline_method)
 
     if a.experiment in ("random_kw_fp", "all"):
         for lm in label_modes:
@@ -1951,17 +1977,19 @@ def main():
                                      label_mode=lm, tag=a.tag, seed=a.seed)
 
     if a.experiment in ("baseline_adi",):
-        experiment_baseline_adi(model, trainset, testset, testloader,
-                                latent_layer, a.device,
-                                teacher_short, a.student_arch, dataset, config,
-                                a.nq, a.rw,
-                                2**(-64), a.dist_epochs, a.dist_lr, a.dist_batch,
-                                ft_fractions, a.ft_epochs, a.ft_lr,
-                                verify_temperature=a.verify_temperature,
-                                tag=a.tag, seed=a.seed,
-                                adi_n_triggers=a.adi_n_triggers,
-                                adi_retrain_epochs=a.adi_retrain_epochs,
-                                adi_lr=a.adi_lr)
+        for lm in label_modes:
+            experiment_baseline_adi(model, trainset, testset, testloader,
+                                    latent_layer, a.device,
+                                    teacher_short, a.student_arch, dataset, config,
+                                    a.nq, a.rw,
+                                    2**(-64), a.dist_epochs, a.dist_lr, a.dist_batch,
+                                    ft_fractions, a.ft_epochs, a.ft_lr,
+                                    verify_temperature=a.verify_temperature,
+                                    label_mode=lm,
+                                    tag=a.tag, seed=a.seed,
+                                    adi_n_triggers=a.adi_n_triggers,
+                                    adi_retrain_epochs=a.adi_retrain_epochs,
+                                    adi_lr=a.adi_lr)
 
     print("\nResults: ./results/{}/{}/   Checkpoints: ./checkpoints/distill/{}/".format(
         a.experiment, dataset, dataset))
