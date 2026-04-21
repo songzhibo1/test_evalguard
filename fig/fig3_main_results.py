@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 V-C Main Results Figure
-EvalGuard watermark verification strength across datasets and label modes.
-Reads from the three experiment CSV files at the project root.
+3×2 grid (datasets × soft/hard). Each panel shows:
+  Left axis: watermark security strength -log10(P) across stages (Base→FT10%)
+             one line per arch pair, threshold line at η=2^{-64}
+  Right axis: student model accuracy at each stage (dashed, same arch colors)
+Reads T=5 soft / T=1 hard from all three experiment CSVs.
 """
 import os
-import pandas as pd
+import csv
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
@@ -25,63 +28,96 @@ mpl.rcParams['ps.fonttype'] = 42
 _here = os.path.dirname(os.path.abspath(__file__))
 _root = os.path.dirname(_here)
 
-THRESHOLD = 64 * np.log10(2)  # -log10(2^-64) ≈ 19.27
-P_FLOOR = 300.0                # cap for 0.0e+00 p-values
+THRESHOLD = 64 * np.log10(2)   # ≈ 19.27
+P_FLOOR   = 300.0
 
-STAGES_SOFT = ['Base', 'FT 1%', 'FT 5%', 'FT 10%']
-P_COLS_SOFT = ['Base_P', 'FT1%_P', 'FT5%_P', 'FT10%_P']
+STAGES     = ['Base', 'FT 1%', 'FT 5%', 'FT 10%']
+P_COLS     = ['Base_P', 'FT1%_P', 'FT5%_P', 'FT10%_P']
+ACC_COLS   = ['Base_Acc', 'FT1%_Acc', 'FT5%_Acc', 'FT10%_Acc']
 
-STAGES_HARD = ['Base', 'FT 1%', 'FT 5%', 'FT 10%']
-P_COLS_HARD = ['Base_P', 'FT1%_P', 'FT5%_P', 'FT10%_P']
-
-ARCH_LABELS = {
+ARCH_SHORT = {
     'resnet20 -> resnet20': 'R20→R20',
     'resnet20 -> vgg11':    'R20→V11',
     'vgg11 -> vgg11':       'V11→V11',
     'resnet56 -> resnet56': 'R56→R56',
     'resnet56 -> resnet20': 'R56→R20',
-    'vgg11 -> vgg11':       'V11→V11',
     'tinyresnet18 -> resnet18':    'TR18→R18',
     'tinyresnet18 -> mobilenetv2': 'TR18→MV2',
 }
 
-STAGE_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+ARCH_COLORS = ['#1f77b4', '#d62728', '#2ca02c', '#ff7f0e', '#9467bd']
+ARCH_MARKERS = ['o', 's', '^', 'D', 'v']
 
 
-def to_log10p(p_str):
+def to_log10p(s):
     try:
-        v = float(str(p_str).strip())
-        if v <= 0.0:
-            return P_FLOOR
-        return min(-np.log10(v), P_FLOOR)
+        v = float(str(s).strip())
+        return P_FLOOR if v <= 0.0 else min(-np.log10(v), P_FLOOR)
     except (ValueError, TypeError):
         return 0.0
 
 
-def load_soft(csv_file, exp_name, temp='5'):
-    df = pd.read_csv(csv_file)
-    rows = df[(df['Experiment'] == exp_name) & (df['Temp'].astype(str) == temp)]
-    results = []
-    for _, r in rows.iterrows():
-        arch = r['Arch_Pair']
-        label = ARCH_LABELS.get(arch, arch)
-        log10ps = [to_log10p(r[c]) for c in P_COLS_SOFT]
-        results.append({'arch': label, 'log10ps': log10ps,
-                        'acc': r['Base_Acc']})
-    return results
+def to_acc(s):
+    try:
+        return float(str(s).replace('%', '').strip())
+    except (ValueError, TypeError):
+        return np.nan
 
 
-def load_hard(csv_file, exp_name):
-    df = pd.read_csv(csv_file)
-    rows = df[df['Experiment'] == exp_name]
-    results = []
-    for _, r in rows.iterrows():
-        arch = r['Arch_Pair']
-        label = ARCH_LABELS.get(arch, arch)
-        log10ps = [to_log10p(r[c]) for c in P_COLS_HARD]
-        results.append({'arch': label, 'log10ps': log10ps,
-                        'acc': r['Base_Acc']})
-    return results
+def load_rows(csv_path, exp_name, arch_pairs, temp=None, beta_pref=None):
+    """Load one representative row per arch pair."""
+    best = {}
+    with open(csv_path) as f:
+        for row in csv.DictReader(f):
+            if row['Experiment'] != exp_name:
+                continue
+            if temp and str(row.get('Temp', '')).strip() != str(temp):
+                continue
+            arch = row['Arch_Pair']
+            if arch not in arch_pairs:
+                continue
+            beta = str(row.get('Beta', '')).strip()
+            if arch not in best or (beta_pref and beta == beta_pref):
+                best[arch] = row
+    return [best[a] for a in arch_pairs if a in best]
+
+
+def extract_series(row):
+    ps   = [to_log10p(row[c]) for c in P_COLS]
+    accs = [to_acc(row[c])    for c in ACC_COLS]
+    return ps, accs
+
+
+def draw_panel(ax, rows, title):
+    ax2 = ax.twinx()
+    x = np.arange(len(STAGES))
+
+    for i, row in enumerate(rows):
+        arch  = ARCH_SHORT.get(row['Arch_Pair'], row['Arch_Pair'][:10])
+        color = ARCH_COLORS[i % len(ARCH_COLORS)]
+        marker = ARCH_MARKERS[i % len(ARCH_MARKERS)]
+        ps, accs = extract_series(row)
+
+        ax.plot(x, ps, '-', color=color, marker=marker, lw=2, ms=6.5,
+                label=arch, zorder=3)
+        ax2.plot(x, accs, '--', color=color, marker=marker, lw=1.4, ms=4.5,
+                 alpha=0.55, zorder=2)
+
+    ax.axhline(THRESHOLD, color='black', ls=':', lw=1.3, alpha=0.7,
+               label=r'$\eta=2^{-64}$')
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(STAGES, fontsize=8.5)
+    ax.set_ylabel(r'$-\log_{10}(p)$  [solid]', fontsize=8.5)
+    ax2.set_ylabel('Accuracy (%)  [dashed]', fontsize=8.5, color='gray')
+    ax2.tick_params(axis='y', labelcolor='gray', labelsize=8)
+    ax2.set_ylim(0, 100)
+    ax.set_ylim(0, min(P_FLOOR + 20, 320))
+    ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(
+        lambda v, _: '≥300' if v >= 299 else f'{int(v)}'))
+    ax.set_title(title, fontweight='bold', fontsize=10)
+    ax.grid(True, ls=':', alpha=0.4)
+    return ax
 
 
 # ── Load data ──────────────────────────────────────────────────────────────────
@@ -90,74 +126,44 @@ c100_csv1 = os.path.join(_root, 'summary_results_c100_mean_rest_v5_full1.csv')
 c100_csv2 = os.path.join(_root, 'summary_results_c100_mean_rest_v5_full2.csv')
 ti_csv    = os.path.join(_root, 'summary_results_tinyimg_mean_rest_v6.csv')
 
-datasets_soft = [
-    ('CIFAR-10',      load_soft(c10_csv,   'ExpA1_MainTable',  temp='5')),
-    ('CIFAR-100',     load_soft(c100_csv1, 'ExpA1_MainTable',  temp='5')),
-    ('TinyImageNet',  load_soft(ti_csv,    'Exp1_Soft_Main',   temp='5')),
+panels = [
+    # (csv, exp_name, arch_pairs, temp, beta_pref, title)
+    (c10_csv,   'ExpA1_MainTable',  ['resnet20 -> resnet20','resnet20 -> vgg11','vgg11 -> vgg11'],
+     '5', '0.5', 'CIFAR-10  (Soft Label API, T=5)'),
+    (c10_csv,   'ExpB1_BGS_Adaptive', ['resnet20 -> resnet20','resnet20 -> vgg11','vgg11 -> vgg11'],
+     None, None, 'CIFAR-10  (Hard Label BGS)'),
+    (c100_csv1, 'ExpA1_MainTable', ['resnet56 -> resnet56','resnet56 -> resnet20','vgg11 -> vgg11'],
+     '5', '0.7', 'CIFAR-100  (Soft Label API, T=5)'),
+    (c100_csv2, 'ExpB1_BGS_Adaptive', ['resnet56 -> resnet56','resnet56 -> resnet20','vgg11 -> vgg11'],
+     None, None, 'CIFAR-100  (Hard Label BGS)'),
+    (ti_csv,    'Exp1_Soft_Main', ['tinyresnet18 -> resnet18','tinyresnet18 -> mobilenetv2'],
+     '5', '0.7', 'Tiny-ImageNet  (Soft Label API, T=5)'),
+    (ti_csv,    'Exp2_Hard_BGS', ['tinyresnet18 -> resnet18','tinyresnet18 -> mobilenetv2'],
+     None, None, 'Tiny-ImageNet  (Hard Label BGS)'),
 ]
-datasets_hard = [
-    ('CIFAR-10',     load_hard(c10_csv,   'ExpB1_BGS_Adaptive')),
-    ('CIFAR-100',    load_hard(c100_csv2, 'ExpB1_BGS_Adaptive')),
-    ('TinyImageNet', load_hard(ti_csv,    'Exp2_Hard_BGS')),
-]
-
-# Deduplicate: for same arch, keep first (beta=0.5 or 0.7, take one)
-def dedup(records):
-    seen, out = set(), []
-    for r in records:
-        if r['arch'] not in seen:
-            seen.add(r['arch'])
-            out.append(r)
-    return out
-
-datasets_soft = [(ds, dedup(recs)) for ds, recs in datasets_soft]
-datasets_hard = [(ds, dedup(recs)) for ds, recs in datasets_hard]
 
 # ── Plot ───────────────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+fig, axes = plt.subplots(3, 2, figsize=(13, 13))
 
-row_titles = ['Soft-Label API', 'Hard-Label BGS']
-all_data = [datasets_soft, datasets_hard]
+for idx, (csv_path, exp, arch_pairs, temp, beta, title) in enumerate(panels):
+    ax = axes[idx // 2, idx % 2]
+    rows = load_rows(csv_path, exp, arch_pairs, temp=temp, beta_pref=beta)
+    draw_panel(ax, rows, title)
+    if idx == 0:
+        ax.legend(fontsize=8, loc='lower left', framealpha=0.9, title='Arch Pair')
 
-for row_idx, (row_title, datasets) in enumerate(zip(row_titles, all_data)):
-    for col_idx, (ds_name, records) in enumerate(datasets):
-        ax = axes[row_idx, col_idx]
+# Global note about dual axes
+fig.text(0.5, 0.01,
+         'Solid lines: Watermark security (left axis, higher = stronger)\n'
+         'Dashed lines: Student accuracy % (right axis, shows model still functional)\n'
+         'Dotted horizontal: Verification threshold η = 2⁻⁶⁴',
+         ha='center', fontsize=9, style='italic',
+         bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.6))
 
-        if not records:
-            ax.text(0.5, 0.5, 'No data', ha='center', va='center',
-                    transform=ax.transAxes)
-            continue
-
-        arch_names = [r['arch'] for r in records]
-        x = np.arange(len(arch_names))
-        n_stages = len(STAGES_SOFT)
-        total_width = 0.72
-        bar_w = total_width / n_stages
-
-        for si, (stage, color) in enumerate(zip(STAGES_SOFT, STAGE_COLORS)):
-            heights = [r['log10ps'][si] for r in records]
-            offset = (si - (n_stages - 1) / 2) * bar_w
-            bars = ax.bar(x + offset, heights, bar_w * 0.9, label=stage,
-                          color=color, alpha=0.85, edgecolor='white', linewidth=0.5)
-
-        ax.axhline(THRESHOLD, color='black', ls='--', lw=1.2, alpha=0.7,
-                   label=r'$\eta=2^{-64}$')
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(arch_names, fontsize=8.5)
-        ax.set_ylim(0, min(P_FLOOR + 20, 340))
-        ax.set_ylabel(r'$-\log_{10}(p)$' if col_idx == 0 else '')
-        ax.set_title(f'{ds_name}\n({row_title})', fontweight='bold', fontsize=10)
-        ax.grid(True, axis='y', ls=':', alpha=0.5)
-        ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(
-            lambda v, _: '≥300' if v >= 299 else f'{int(v)}'))
-
-        if row_idx == 0 and col_idx == 2:
-            ax.legend(fontsize=8, loc='upper right', framealpha=0.9)
-
-fig.suptitle('EvalGuard Watermark Verification: Security Strength Across All Configurations',
-             fontweight='bold', fontsize=12, y=1.01)
-fig.tight_layout()
+fig.suptitle(
+    'EvalGuard Main Results: Security Strength and Student Accuracy Across Stages',
+    fontweight='bold', fontsize=12, y=1.00)
+fig.tight_layout(rect=[0, 0.06, 1, 1])
 
 out_path = os.path.join(_here, 'main_results.pdf')
 fig.savefig(out_path, bbox_inches='tight')
