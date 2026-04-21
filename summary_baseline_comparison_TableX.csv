@@ -1,0 +1,19 @@
+Dataset,Method,L_Mode,Arch_Pair,Tag,NQ,Temp,T_Acc,Base_Acc,Base_Sig,Base_P,Base_Ver,FT1%_Acc,FT1%_Sig,FT1%_P,FT1%_Ver,FT5%_Acc,FT5%_Sig,FT5%_P,FT5%_Ver,FT10%_Acc,FT10%_Sig,FT10%_P,FT10%_Ver
+CIFAR10,Adi (Backdoor),hard,resnet20 -> resnet20,N/A,50000,5,92.6% (BD: 92.4%),78.6%,7.00%,8.8e-01,False,80.3%,7.00%,8.8e-01,False,81.1%,7.00%,8.8e-01,False,81.4%,9.00%,6.8e-01,False
+CIFAR10,Adi (Backdoor),soft,resnet20 -> resnet20,N/A,50000,5,92.6% (BD: 92.3%),83.6%,9.00%,6.8e-01,False,83.9%,11.00%,4.2e-01,False,83.6%,7.00%,8.8e-01,False,83.4%,8.00%,7.9e-01,False
+CIFAR10,DAWN,hard,resnet20 -> resnet20,N/A,50000,5,92.6%,71.4%,94.56%,0.0e+00,True,73.4%,97.36%,0.0e+00,True,74.6%,95.74%,0.0e+00,True,75.5%,92.07%,0.0e+00,True
+CIFAR10,DAWN,soft,resnet20 -> resnet20,N/A,50000,5,92.6%,76.5%,99.13%,0.0e+00,True,77.0%,98.29%,0.0e+00,True,77.8%,95.43%,0.0e+00,True,78.3%,87.04%,0.0e+00,True
+CIFAR10,EvalGuard,hard,resnet20 -> resnet20,bl_evalguard_c10_hard_r20_r20,50000,1,92.6%,79.0%,98.44%,0.0e+00,True,79.3%,98.60%,0.0e+00,True,79.8%,97.98%,0.0e+00,True,80.0%,97.20%,0.0e+00,True
+CIFAR10,EvalGuard,soft,resnet20 -> resnet20,bl_evalguard_c10_soft_r20_r20,50000,5,92.6%,83.7%,0.0139,1.9e-256,True,83.7%,0.0133,5.8e-232,True,83.8%,0.0121,6.7e-218,True,84.0%,0.0113,6.2e-206,True
+CIFAR100,Adi (Backdoor),hard,resnet56 -> resnet56,N/A,50000,5,72.6% (BD: 72.2%),49.3%,1.00%,6.3e-01,False,50.8%,1.00%,6.3e-01,False,52.5%,0.00%,1.0e+00,False,52.7%,0.00%,1.0e+00,False
+CIFAR100,Adi (Backdoor),soft,resnet56 -> resnet56,N/A,50000,5,72.6% (BD: 72.3%),58.2%,0.00%,1.0e+00,False,57.6%,0.00%,1.0e+00,False,58.0%,0.00%,1.0e+00,False,58.3%,1.00%,6.3e-01,False
+CIFAR100,DAWN,hard,resnet56 -> resnet56,N/A,50000,5,72.6%,45.3%,98.49%,0.0e+00,True,46.9%,98.69%,0.0e+00,True,48.4%,98.27%,0.0e+00,True,49.3%,97.10%,0.0e+00,True
+CIFAR100,DAWN,soft,resnet56 -> resnet56,N/A,50000,5,72.6%,55.4%,98.08%,0.0e+00,True,55.2%,92.32%,0.0e+00,True,56.2%,87.22%,0.0e+00,True,57.1%,84.90%,0.0e+00,True
+CIFAR100,EvalGuard,hard,resnet56 -> resnet56,bl_evalguard_c100_hard_r56_r56,50000,1,72.6%,48.7%,96.61%,0.0e+00,True,49.9%,97.36%,0.0e+00,True,51.6%,97.18%,0.0e+00,True,52.6%,96.05%,0.0e+00,True
+CIFAR100,EvalGuard,soft,resnet56 -> resnet56,bl_evalguard_c100_soft_r56_r56,50000,5,72.6%,57.2%,0.0039,0.0e+00,True,57.0%,0.0038,0.0e+00,True,57.6%,0.0033,0.0e+00,True,57.7%,0.0029,0.0e+00,True
+TINYIMAGENET,Adi (Backdoor),hard,tinyresnet18 -> resnet18,N/A,50000,5,60.2% (BD: 62.9%),24.3%,1.00%,3.9e-01,False,22.2%,1.00%,3.9e-01,False,20.8%,1.00%,3.9e-01,False,21.1%,1.00%,3.9e-01,False
+TINYIMAGENET,Adi (Backdoor),soft,tinyresnet18 -> resnet18,N/A,50000,5,60.2% (BD: 62.8%),48.5%,0.00%,1.0e+00,False,42.6%,0.00%,1.0e+00,False,42.0%,0.00%,1.0e+00,False,40.5%,1.00%,3.9e-01,False
+TINYIMAGENET,DAWN,hard,tinyresnet18 -> resnet18,N/A,50000,5,60.2%,22.1%,99.37%,0.0e+00,True,19.0%,95.24%,0.0e+00,True,16.3%,88.43%,0.0e+00,True,16.3%,86.16%,0.0e+00,True
+TINYIMAGENET,DAWN,soft,tinyresnet18 -> resnet18,N/A,50000,5,60.2%,45.5%,97.72%,0.0e+00,True,37.7%,77.79%,0.0e+00,True,36.1%,75.39%,0.0e+00,True,34.0%,70.37%,0.0e+00,True
+TINYIMAGENET,EvalGuard,hard,tinyresnet18 -> resnet18,bl_evalguard_ti_hard_r18_r18,50000,1,60.2%,22.8%,99.04%,0.0e+00,True,20.5%,94.26%,0.0e+00,True,18.2%,94.74%,0.0e+00,True,18.3%,94.74%,0.0e+00,True
+TINYIMAGENET,EvalGuard,soft,tinyresnet18 -> resnet18,bl_evalguard_ti_soft_r18_r18,50000,5,60.2%,45.8%,0.0032,0.0e+00,True,37.7%,0.0026,0.0e+00,True,36.7%,0.0030,0.0e+00,True,35.0%,0.0030,0.0e+00,True
