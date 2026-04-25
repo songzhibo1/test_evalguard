@@ -14,12 +14,12 @@ Attacks tested per model:
   2. Magnitude pruning attack  — remove p% of smallest-magnitude weights,
        at prune fractions: 25%, 50%, 75%.
 
-Models tested:
-  CIFAR-10      ResNet-20  (cifar10_resnet20,    10 classes)
-  CIFAR-10      VGG-11     (cifar10_vgg11,       10 classes)
-  CIFAR-100     ResNet-56  (cifar100_resnet56,  100 classes)
-  CIFAR-100     VGG-11     (cifar100_vgg11,     100 classes)
-  Tiny-ImageNet ResNet-18  (tinyimagenet_resnet18, 200 classes)
+Models tested (pretrained weights loaded automatically — no training needed):
+  CIFAR-10      ResNet-20  (cifar10_resnet20,    10 classes, ~92.6%)
+  CIFAR-10      VGG-11     (cifar10_vgg11,       10 classes, ~92.8%)
+  CIFAR-100     ResNet-56  (cifar100_resnet56,  100 classes, ~74.0%)
+  CIFAR-100     VGG-11     (cifar100_vgg11,     100 classes, ~70.0%)
+  Tiny-ImageNet ResNet-18  (tinyimagenet_resnet18, 200 classes, ~60.1%)
 
 Usage
 -----
@@ -45,13 +45,10 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.optim as optim   # used by fine_tune_surrogate internally
 from torch.utils.data import DataLoader, Subset
 
-from evalguard.configs import (
-    CONFIGS,
-    cifar10_data, cifar100_data, tinyimagenet_data,
-)
+from evalguard.configs import CONFIGS
 from evalguard.obfuscation import obfuscate_model_vectorized
 from evalguard.attacks import fine_tune_surrogate, prune_surrogate
 
@@ -91,6 +88,18 @@ DATASET_GROUPS = {
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+def load_pretrained_teacher(config_key: str) -> nn.Module:
+    """
+    Load pretrained teacher via config["model_fn"](pretrained=True).
+    model_fn returns (model, layer_name) — unpack and return model only.
+    """
+    config = CONFIGS[config_key]
+    result = config["model_fn"](pretrained=True)
+    # All model_fn in configs.py return (model, layer_name_str)
+    model = result[0] if isinstance(result, (tuple, list)) else result
+    return model
+
+
 def evaluate_accuracy(model: nn.Module, loader: DataLoader, device: str) -> float:
     model.to(device).eval()
     correct, total = 0, 0
@@ -100,24 +109,6 @@ def evaluate_accuracy(model: nn.Module, loader: DataLoader, device: str) -> floa
             correct += model(x).argmax(1).eq(y).sum().item()
             total   += y.size(0)
     return 100.0 * correct / total if total > 0 else 0.0
-
-
-def train_teacher(teacher: nn.Module, train_loader: DataLoader,
-                  epochs: int, lr: float, device: str) -> nn.Module:
-    teacher.to(device).train()
-    crit = nn.CrossEntropyLoss()
-    opt  = optim.SGD(teacher.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
-    sch  = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-    for ep in range(epochs):
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
-            opt.zero_grad()
-            crit(teacher(x), y).backward()
-            opt.step()
-        sch.step()
-        if (ep + 1) % 10 == 0:
-            print(f"    Teacher epoch {ep+1}/{epochs}")
-    return teacher
 
 
 def subset_loader(dataset, ratio: float, batch_size: int,
@@ -167,8 +158,8 @@ def prune_attack(obf_model: nn.Module, test_loader: DataLoader,
 
 # ── Per-config experiment ──────────────────────────────────────────────────────
 
-def run_config(config_key: str, device: str, teacher_epochs: int,
-               ft_epochs: int, out_dir: Path) -> dict:
+def run_config(config_key: str, device: str, ft_epochs: int,
+               out_dir: Path) -> dict:
     ds_label, arch_label = CONFIG_LABEL[config_key]
     config = CONFIGS[config_key]
 
@@ -180,25 +171,12 @@ def run_config(config_key: str, device: str, teacher_epochs: int,
     print("  [1/4] Loading dataset …")
     train_set, _, train_loader, test_loader = config["data_fn"](batch_size=128)
 
-    # ── 2. Build & train clean teacher ────────────────────────────────────────
-    print("  [2/4] Building clean teacher …")
-    ckpt_path = out_dir / f"{config_key}_clean_teacher.pt"
-    teacher   = config["model_fn"]()
-
-    if ckpt_path.exists():
-        teacher.load_state_dict(torch.load(ckpt_path, map_location="cpu",
-                                           weights_only=True))
-        print(f"    Loaded from cache: {ckpt_path}")
-    else:
-        print("    Training clean teacher from scratch …")
-        teacher = train_teacher(teacher, train_loader,
-                                epochs=teacher_epochs, lr=0.1, device=device)
-        torch.save(teacher.state_dict(), ckpt_path)
-        print(f"    Saved: {ckpt_path}")
-
+    # ── 2. Load pretrained teacher (no training needed) ───────────────────────
+    print("  [2/4] Loading pretrained teacher …")
+    teacher = load_pretrained_teacher(config_key)
     teacher.to(device)
     clean_acc = evaluate_accuracy(teacher, test_loader, device)
-    print(f"    Clean teacher accuracy: {clean_acc:.2f}%")
+    print(f"    Pretrained teacher accuracy: {clean_acc:.2f}%")
 
     # ── 3. Obfuscate teacher ───────────────────────────────────────────────────
     print("  [3/4] Obfuscating teacher (Algorithm 1, ε=50, δ=2⁻³²) …")
@@ -322,8 +300,6 @@ config choices (group shortcut):
                         f"Choices: {', '.join(_CONFIG_CHOICES)}")
     p.add_argument("--device",
                    default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--teacher-epochs", type=int, default=80,
-                   help="Epochs for clean-teacher training (default: 80)")
     p.add_argument("--ft-epochs", type=int, default=50,
                    help="Epochs per fine-tuning budget (default: 50)")
     p.add_argument("--out_dir", default="results/obfuscated_attack",
@@ -352,7 +328,6 @@ if __name__ == "__main__":
         result = run_config(
             config_key=cfg_key,
             device=args.device,
-            teacher_epochs=args.teacher_epochs,
             ft_epochs=args.ft_epochs,
             out_dir=out_dir,
         )

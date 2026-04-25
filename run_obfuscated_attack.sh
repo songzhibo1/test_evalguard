@@ -31,7 +31,6 @@ cd "$SCRIPT_DIR"
 
 OUT_DIR="results/obfuscated_attack"
 LOG_DIR="logs/obfuscated_attack"
-TEACHER_EPOCHS=80     # epochs for clean-teacher training
 FT_EPOCHS=50          # epochs per fine-tuning budget
 PYTHON="${PYTHON:-python3}"
 
@@ -94,11 +93,10 @@ run_one() {
     echo "  >> ${config}  on ${device}  (log: ${logfile})"
 
     "$PYTHON" obfuscated_attack_experiments.py \
-        --config        "$config"         \
-        --device        "$device"         \
-        --teacher-epochs "$TEACHER_EPOCHS" \
-        --ft-epochs      "$FT_EPOCHS"     \
-        --out_dir        "$OUT_DIR"        \
+        --config    "$config"    \
+        --device    "$device"    \
+        --ft-epochs "$FT_EPOCHS" \
+        --out_dir   "$OUT_DIR"   \
         2>&1 | tee "$logfile"
 
     echo "  << Done: ${config}"
