@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import copy
 import json
+import math
 import time
 from pathlib import Path
 
@@ -50,15 +51,23 @@ from torch.utils.data import DataLoader, Subset
 
 from evalguard.configs import CONFIGS
 from evalguard.obfuscation import obfuscate_model_vectorized
-from evalguard.attacks import fine_tune_surrogate, prune_surrogate
+from evalguard.attacks import prune_surrogate
 
 import numpy as np
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-FT_RATIOS  = [0.01, 0.05, 0.10, 0.20, 0.50, 1.00]   # fraction of train set
-PRUNE_FRAC = [0.25, 0.50, 0.75]                       # weight-magnitude thresholds
+FT_RATIOS      = [0.01, 0.05, 0.10, 0.20, 0.50, 1.00]  # fraction of train set
+FT_STRATEGIES  = ["FTAL", "FTLL", "RTFL"]              # fine-tuning strategies
+PRUNE_FRAC     = [0.25, 0.50, 0.75]                    # weight-magnitude thresholds
+
+# Fine-tuning strategy descriptions (for terminal/logs)
+FT_DESC = {
+    "FTAL": "Full-layer fine-tune (all weights, obfuscated init)",
+    "FTLL": "Last-layer only fine-tune (all other layers frozen)",
+    "RTFL": "Reset last layer + full-layer fine-tune (strongest attack)",
+}
 
 # All 5 model configs; each entry is a CONFIGS key.
 ALL_CONFIGS = [
@@ -118,24 +127,91 @@ def subset_loader(dataset, ratio: float, batch_size: int,
                       shuffle=True, num_workers=num_workers)
 
 
+def _get_last_linear(model: nn.Module) -> nn.Linear:
+    """Return the last nn.Linear layer in the model (classifier head)."""
+    last = None
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            last = m
+    if last is None:
+        raise ValueError("No nn.Linear found in model")
+    return last
+
+
+def _reset_last_layer(model: nn.Module) -> nn.Module:
+    """Re-initialise the last Linear layer to Kaiming uniform (clean random init)."""
+    fc = _get_last_linear(model)
+    nn.init.kaiming_uniform_(fc.weight, a=math.sqrt(5))
+    if fc.bias is not None:
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(fc.weight)
+        bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0.0
+        nn.init.uniform_(fc.bias, -bound, bound)
+    return model
+
+
+def _freeze_all_except_last(model: nn.Module) -> nn.Module:
+    """Freeze every parameter except the last Linear layer."""
+    last_fc = _get_last_linear(model)
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in last_fc.parameters():
+        p.requires_grad = True
+    return model
+
+
 def ft_attack(obf_model: nn.Module, train_set, test_loader: DataLoader,
-              ratio: float, ft_epochs: int, device: str) -> dict:
-    """Fine-tune the obfuscated model on `ratio` fraction of clean train data."""
+              ratio: float, ft_epochs: int, strategy: str, device: str) -> dict:
+    """
+    Fine-tune the obfuscated model under three strategies:
+
+    FTAL — Fine-Tune ALL Layers
+        Standard full-model SGD; strongest baseline for "brute-force" recovery.
+
+    FTLL — Fine-Tune Last Layer only
+        All conv/bn layers frozen; only the classifier head is updated.
+        Lower-bound attack: shows what a resourced-limited attacker can achieve.
+
+    RTFL — Reset last layer + Fine-Tune ALL Layers
+        Classifier head is re-initialised to Kaiming before full fine-tuning.
+        Strongest attack: removes noisy head signal, then optimises globally.
+    """
+    assert strategy in ("FTAL", "FTLL", "RTFL"), f"Unknown strategy: {strategy}"
+
     model_copy = copy.deepcopy(obf_model).to(device)
     ft_loader  = subset_loader(train_set, ratio, batch_size=128)
     n_samples  = len(ft_loader.dataset)
 
-    t0 = time.time()
-    model_copy, _ = fine_tune_surrogate(
-        model_copy, ft_loader,
-        epochs=ft_epochs,
-        lr=0.01,       # higher LR than default — must overcome large noise init
-        device=device,
-    )
-    elapsed = time.time() - t0
-    acc = evaluate_accuracy(model_copy, test_loader, device)
+    # ── Strategy-specific preparation ─────────────────────────────────────────
+    if strategy == "RTFL":
+        _reset_last_layer(model_copy)           # clean head, then train all
+    elif strategy == "FTLL":
+        _freeze_all_except_last(model_copy)     # freeze body, train head only
 
+    trainable = [p for p in model_copy.parameters() if p.requires_grad]
+    optimizer  = optim.SGD(trainable, lr=0.01, momentum=0.9, weight_decay=5e-4)
+    scheduler  = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=ft_epochs)
+    criterion  = nn.CrossEntropyLoss()
+
+    t0 = time.time()
+    model_copy.train()
+    for ep in range(ft_epochs):
+        for x, y in ft_loader:
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            criterion(model_copy(x), y).backward()
+            optimizer.step()
+        scheduler.step()
+        if (ep + 1) % 10 == 0:
+            print(f"      [{strategy}] epoch {ep+1}/{ft_epochs}")
+    elapsed = time.time() - t0
+
+    # Unfreeze all before evaluation (belt-and-suspenders)
+    for p in model_copy.parameters():
+        p.requires_grad = True
+
+    acc = evaluate_accuracy(model_copy, test_loader, device)
     return {
+        "strategy":  strategy,
         "ratio":     ratio,
         "n_samples": n_samples,
         "ft_epochs": ft_epochs,
@@ -188,15 +264,20 @@ def run_config(config_key: str, device: str, ft_epochs: int,
     obf_acc = evaluate_accuracy(obf_teacher, test_loader, device)
     print(f"    Obfuscated model accuracy: {obf_acc:.2f}%  (σ={secret.sigma:.4f})")
 
-    # ── 4a. Fine-tuning attacks ────────────────────────────────────────────────
-    print("  [4a/4] Fine-tuning attack …")
-    ft_results = []
-    for ratio in FT_RATIOS:
-        res = ft_attack(obf_teacher, train_set, test_loader,
-                        ratio=ratio, ft_epochs=ft_epochs, device=device)
-        ft_results.append(res)
-        print(f"    FT {ratio*100:5.1f}%  ({res['n_samples']:6d} samples)  "
-              f"→ acc={res['acc_pct']:.2f}%")
+    # ── 4a. Fine-tuning attacks (FTAL / FTLL / RTFL) ──────────────────────────
+    print("  [4a/4] Fine-tuning attacks …")
+    ft_results = {}          # strategy → list of per-ratio dicts
+    for strategy in FT_STRATEGIES:
+        print(f"\n    Strategy: {strategy}  — {FT_DESC[strategy]}")
+        strategy_rows = []
+        for ratio in FT_RATIOS:
+            res = ft_attack(obf_teacher, train_set, test_loader,
+                            ratio=ratio, ft_epochs=ft_epochs,
+                            strategy=strategy, device=device)
+            strategy_rows.append(res)
+            print(f"      {strategy} {ratio*100:5.1f}%  "
+                  f"({res['n_samples']:6d} samples)  → acc={res['acc_pct']:.2f}%")
+        ft_results[strategy] = strategy_rows
 
     # ── 4b. Pruning attacks ────────────────────────────────────────────────────
     print("  [4b/4] Pruning attack …")
@@ -228,30 +309,36 @@ def run_config(config_key: str, device: str, ft_epochs: int,
 # ── Summary tables ─────────────────────────────────────────────────────────────
 
 def print_summary(all_results: list[dict]):
-    W = 88
+    W = 96
     print("\n" + "="*W)
     print("  SUMMARY — Obfuscated-Model Attack Results")
     print("="*W)
 
-    # FT table
-    print(f"  {'Dataset':<14} {'Arch':<10} {'Clean':>7} {'Obf.':>6}"
+    # ── FT table: one row per (model, strategy) ───────────────────────────────
+    print(f"  {'Dataset':<14} {'Arch':<10} {'Strat':5} {'Clean':>7} {'Obf.':>6}"
           f"  {'FT 1%':>6} {'FT 5%':>6} {'FT10%':>6} {'FT50%':>6} {'FT100%':>7}")
     print("  " + "-"*(W-2))
-    prev_ds = ""
+    prev_key = ""
     for r in all_results:
-        if r["dataset"] != prev_ds and prev_ds:
-            print("  " + "-"*(W-2))
-        prev_ds = r["dataset"]
-        ft = {x["ratio"]: x["acc_pct"] for x in r["ft_attack"]}
-        print(f"  {r['dataset']:<14} {r['arch']:<10} "
-              f"{r['clean_teacher_acc']:>6.1f}% {r['obf_acc']:>5.1f}%"
-              f"  {ft.get(0.01,0):>5.1f}% {ft.get(0.05,0):>5.1f}%"
-              f" {ft.get(0.10,0):>5.1f}% {ft.get(0.50,0):>5.1f}%"
-              f" {ft.get(1.00,0):>6.1f}%")
+        # blank separator between model configs
+        cur_key = r["config_key"]
+        if cur_key != prev_key and prev_key:
+            print()
+        prev_key = cur_key
+
+        ft_dict = r.get("ft_attack", {})
+        for strategy in FT_STRATEGIES:
+            rows = ft_dict.get(strategy, [])
+            ft = {x["ratio"]: x["acc_pct"] for x in rows}
+            print(f"  {r['dataset']:<14} {r['arch']:<10} {strategy:5}"
+                  f" {r['clean_teacher_acc']:>6.1f}% {r['obf_acc']:>5.1f}%"
+                  f"  {ft.get(0.01,0):>5.1f}% {ft.get(0.05,0):>5.1f}%"
+                  f" {ft.get(0.10,0):>5.1f}% {ft.get(0.50,0):>5.1f}%"
+                  f" {ft.get(1.00,0):>6.1f}%")
 
     print()
 
-    # Pruning table
+    # ── Pruning table ─────────────────────────────────────────────────────────
     print(f"  {'Dataset':<14} {'Arch':<10} {'Clean':>7} {'Obf.':>6}"
           f"  {'Prune25':>8} {'Prune50':>8} {'Prune75':>8}")
     print("  " + "-"*(W-2))
@@ -267,8 +354,10 @@ def print_summary(all_results: list[dict]):
               f" {pr.get(0.75,0):>7.1f}%")
 
     print("="*W)
-    print("  Obfuscation renders stolen weights useless — neither FT nor pruning")
-    print("  can recover clean-model accuracy without the secret key K_obf.")
+    print("  FT strategies: FTAL=all layers · FTLL=last layer only · "
+          "RTFL=reset head + all layers")
+    print("  Even RTFL (strongest) cannot fully recover clean-model accuracy "
+          "without the secret key K_obf.")
     print("="*W + "\n")
 
 

@@ -172,22 +172,27 @@ if not summary.exists():
 with open(summary) as f:
     results = json.load(f)
 
+STRATEGIES = ["FTAL", "FTLL", "RTFL"]
+
 # ── FT table ──
-print(f"  {'Dataset':<14} {'Arch':<10} {'Clean':>7} {'Obf.':>6}"
+print(f"  {'Dataset':<14} {'Arch':<10} {'Strat':5} {'Clean':>7} {'Obf.':>6}"
       f"  {'FT 1%':>6} {'FT 5%':>6} {'FT10%':>6} {'FT50%':>6} {'FT100%':>7}")
-print("  " + "-"*84)
+print("  " + "-"*90)
 prev = ""
 for r in results:
-    ds = r.get("dataset","?")
-    if ds != prev and prev:
-        print("  " + "-"*84)
-    prev = ds
-    ft = {x["ratio"]: x["acc_pct"] for x in r.get("ft_attack", [])}
-    print(f"  {ds:<14} {r.get('arch','?'):<10} "
-          f"{r.get('clean_teacher_acc',0):>6.1f}% {r.get('obf_acc',0):>5.1f}%"
-          f"  {ft.get(0.01,0):>5.1f}% {ft.get(0.05,0):>5.1f}%"
-          f" {ft.get(0.10,0):>5.1f}% {ft.get(0.50,0):>5.1f}%"
-          f" {ft.get(1.00,0):>6.1f}%")
+    cur = r.get("config_key","?")
+    if cur != prev and prev:
+        print()
+    prev = cur
+    ft_dict = r.get("ft_attack", {})
+    for strategy in STRATEGIES:
+        rows = ft_dict.get(strategy, [])
+        ft = {x["ratio"]: x["acc_pct"] for x in rows}
+        print(f"  {r.get('dataset','?'):<14} {r.get('arch','?'):<10} {strategy:5}"
+              f" {r.get('clean_teacher_acc',0):>6.1f}% {r.get('obf_acc',0):>5.1f}%"
+              f"  {ft.get(0.01,0):>5.1f}% {ft.get(0.05,0):>5.1f}%"
+              f" {ft.get(0.10,0):>5.1f}% {ft.get(0.50,0):>5.1f}%"
+              f" {ft.get(1.00,0):>6.1f}%")
 
 print()
 
